@@ -2,6 +2,8 @@
 Configuration constants for VLR.GG API
 """
 
+import os
+
 # Base URLs
 VLR_BASE_URL = "https://www.vlr.gg"
 VLR_EVENTS_URL = f"{VLR_BASE_URL}/events"
@@ -68,6 +70,19 @@ CACHE_TTL_TEAM_TRANSACTIONS = 3600
 CACHE_TTL_TEAM_STATS = 600
 CACHE_TTL_EVENT_MATCHES = 600
 CACHE_TTL_HEALTH_UPSTREAM = 60
+
+# CORS
+# CORS_ALLOWED_ORIGINS: comma-separated exact origins allowed to make cross-origin
+# browser requests (e.g. "https://foo.vercel.app,http://localhost:5500"). Unset ->
+# no origins allowed, so browser access is blocked until explicitly configured.
+CORS_ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.environ.get("CORS_ALLOWED_ORIGINS", "").split(",")
+    if origin.strip()
+]
+# CORS_ALLOWED_ORIGIN_REGEX: optional regex matched against the request Origin,
+# for hosts that vary per deploy (e.g. Vercel preview subdomains). Unset -> None.
+CORS_ALLOWED_ORIGIN_REGEX = os.environ.get("CORS_ALLOWED_ORIGIN_REGEX") or None
 
 # /stats region vocabulary
 # The /stats page uses a DIFFERENT region taxonomy from /rankings. vlr.gg's
