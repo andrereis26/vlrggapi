@@ -74,6 +74,7 @@ Interactive Swagger docs are available at `/`.
 - **Rate limit** - requests are limited to `600/minute`
 - **Error handling** - V2 returns HTTP 400 for invalid input and propagates upstream failures with HTTP error codes
 - **Deployment targets** - Vercel for the hosted API, Docker for containerized self-hosting
+- **CORS** - disabled by default (no cross-origin browser access); configure via env vars `CORS_ALLOWED_ORIGINS` (comma-separated exact origins, e.g. `https://foo.vercel.app,http://localhost:5500`) and/or `CORS_ALLOWED_ORIGIN_REGEX` (a single regex, e.g. `^https://foo.*\.vercel\.app$`, useful for Vercel preview subdomains)
 
 ## V2 Endpoint Overview
 

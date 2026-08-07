@@ -3,11 +3,18 @@ from contextlib import asynccontextmanager
 
 import uvicorn
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from api.utils.rate_limiter import RateLimitMiddleware
 from routers.v2_router import router as v2_router
 from routers.vlr_router import router as vlr_router
-from utils.constants import API_DESCRIPTION, API_PORT, API_TITLE
+from utils.constants import (
+    API_DESCRIPTION,
+    API_PORT,
+    API_TITLE,
+    CORS_ALLOWED_ORIGIN_REGEX,
+    CORS_ALLOWED_ORIGINS,
+)
 from utils.http_client import close_http_client
 
 logging.basicConfig(level=logging.INFO)
@@ -31,6 +38,18 @@ app = FastAPI(
 )
 
 app.add_middleware(RateLimitMiddleware)
+
+# Registered after RateLimitMiddleware so it becomes the outermost layer,
+# letting it answer preflight OPTIONS requests before rate limiting and
+# attach CORS headers to a 429 response.
+if CORS_ALLOWED_ORIGINS or CORS_ALLOWED_ORIGIN_REGEX:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=CORS_ALLOWED_ORIGINS,
+        allow_origin_regex=CORS_ALLOWED_ORIGIN_REGEX,
+        allow_methods=["GET"],
+        allow_headers=["*"],
+    )
 
 app.include_router(vlr_router)
 app.include_router(v2_router)
