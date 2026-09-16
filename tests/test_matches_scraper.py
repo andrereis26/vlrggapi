@@ -1,8 +1,9 @@
 import httpx
 import pytest
 
-from api.scrapers.matches import vlr_live_score, vlr_upcoming_matches
+from api.scrapers.matches import _parse_upcoming_page, vlr_live_score, vlr_upcoming_matches
 from utils.cache_manager import cache_manager
+from utils.html_parsers import HTMLParser
 
 UPCOMING_HTML = """
 <html>
@@ -65,6 +66,38 @@ MULTI_LIVE_HTML = """
 """
 
 
+UPCOMING_EXTENDED_HTML = """
+<html>
+  <div class="wf-label mod-large">Thu, September 24, 2026</div>
+  <div class="wf-card">
+    <a href="/753454/tyloo-vs-g2-esports-valorant-champions-2026-opening-c" class="wf-module-item match-item">
+      <div class="match-item-time">1:00 PM</div>
+      <div class="match-item-vs">
+        <div class="match-item-vs-team">
+          <div class="match-item-vs-team-name">TYLOO</div>
+          <div class="match-item-vs-team-score mod-upcoming">&ndash;</div>
+        </div>
+        <div class="match-item-vs-team">
+          <div class="match-item-vs-team-name">G2 Esports</div>
+          <div class="match-item-vs-team-score mod-upcoming">&ndash;</div>
+        </div>
+      </div>
+      <div class="match-item-eta">
+        <div class="ml">
+          <div class="ml-status">Upcoming</div>
+          <div class="ml-eta">1w 1d</div>
+        </div>
+      </div>
+      <div class="match-item-event">
+        <div class="match-item-event-series">Group Stage&ndash;Opening (C)</div>
+        Valorant Champions 2026
+      </div>
+    </a>
+  </div>
+</html>
+"""
+
+
 class FakeResponse:
     def __init__(self, status_code: int, text: str):
         self.status_code = status_code
@@ -81,6 +114,20 @@ class FakeAsyncClient:
     async def get(self, url: str, timeout=None, headers=None):
         self.calls.append((url, timeout))
         return self._responses[url].pop(0)
+
+
+def test_parse_upcoming_extended_prefers_exact_page_datetime_over_eta():
+    data = _parse_upcoming_page(
+        HTMLParser(UPCOMING_EXTENDED_HTML),
+        1,
+        reference_timestamps={"753454": "2026-09-24 12:00:00"},
+    )
+
+    assert len(data) == 1
+    assert data[0]["team1"] == "TYLOO"
+    assert data[0]["team2"] == "G2 Esports"
+    assert data[0]["time_until_match"] == "Upcoming"
+    assert data[0]["unix_timestamp"] == "2026-09-24 12:00:00"
 
 
 @pytest.mark.anyio

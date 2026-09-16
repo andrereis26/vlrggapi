@@ -160,25 +160,113 @@ def extract_match_teams(item, selector: str = ".h-match-team") -> tuple[dict, di
 # --- Timestamp parsing helpers (moved from matches.py) ---
 
 def parse_eta_to_timedelta(eta_text: str) -> timedelta | None:
-    """Parse '4h 1m' / '1d 2h' / '30m' into timedelta. Returns None for LIVE/ago/unparseable."""
+    """Parse '1w 2d' / '4h 1m' / '30m' into timedelta. Returns None for LIVE/ago/unparseable."""
     if not eta_text:
         return None
     eta_text = eta_text.strip()
     if not eta_text or "LIVE" in eta_text.upper() or "ago" in eta_text.lower():
         return None
-    pattern = re.findall(r"(\d+)\s*([dhm])", eta_text.lower())
+    pattern = re.findall(r"(\d+)\s*([wdhm])", eta_text.lower())
     if not pattern:
         return None
     total = timedelta()
     for value, unit in pattern:
         value = int(value)
-        if unit == "d":
+        if unit == "w":
+            total += timedelta(weeks=value)
+        elif unit == "d":
             total += timedelta(days=value)
         elif unit == "h":
             total += timedelta(hours=value)
         elif unit == "m":
             total += timedelta(minutes=value)
     return total if total > timedelta() else None
+
+
+def parse_match_datetime_local(date_str: str, time_text: str) -> datetime | None:
+    """Parse a VLR match date header and visible clock time as a naive local datetime."""
+    if not date_str or not time_text:
+        return None
+
+    time_text = time_text.strip()
+    if not time_text or time_text.upper() in ("TBD", "LIVE", "-"):
+        return None
+
+    cleaned_date = date_str.strip()
+    cleaned_date = re.sub(r"\b(Today|Tomorrow)\b", "", cleaned_date, flags=re.IGNORECASE).strip()
+    cleaned_date = re.sub(r"^[A-Za-z]+,\s*", "", cleaned_date)
+
+    if cleaned_date.lower() in ("today", "tomorrow"):
+        local_day = datetime.now()
+        if cleaned_date.lower() == "tomorrow":
+            local_day += timedelta(days=1)
+        cleaned_date = local_day.strftime("%B %d, %Y")
+
+    parsed_time = None
+    for fmt in ("%I:%M %p", "%H:%M"):
+        try:
+            parsed_time = datetime.strptime(time_text, fmt).time()
+            break
+        except ValueError:
+            continue
+    if parsed_time is None:
+        return None
+
+    parsed_date = None
+    for fmt in ("%B %d, %Y", "%b %d, %Y"):
+        try:
+            parsed_date = datetime.strptime(cleaned_date, fmt).date()
+            break
+        except ValueError:
+            continue
+    if parsed_date is None:
+        return None
+
+    return datetime.combine(parsed_date, parsed_time)
+
+
+def _format_utc(dt: datetime) -> str:
+    return dt.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def parse_vlr_data_timestamp(value: str) -> str:
+    """Parse VLR's data-utc-ts attribute into the API's UTC timestamp string."""
+    if not value:
+        return ""
+
+    timestamp = value.strip()
+
+    if timestamp.isdigit():
+        try:
+            return datetime.fromtimestamp(int(timestamp), tz=UTC).strftime("%Y-%m-%d %H:%M:%S")
+        except (ValueError, OSError):
+            return ""
+
+    # VLR detail pages currently label this as UTC, but the string is stored as
+    # America/New_York wall time. The homepage uses numeric Unix seconds instead.
+    eastern = ZoneInfo("America/New_York")
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            local_dt = datetime.strptime(timestamp, fmt).replace(tzinfo=eastern)
+            return _format_utc(local_dt)
+        except ValueError:
+            continue
+
+    return ""
+
+
+def combine_date_and_time_with_offset(
+    date_str: str,
+    time_text: str,
+    utc_offset: timedelta,
+) -> str:
+    """Parse a VLR list date/time rendered in a known page timezone offset."""
+    local_dt = parse_match_datetime_local(date_str, time_text)
+    if local_dt is None:
+        return ""
+
+    utc_dt = (local_dt - utc_offset).replace(tzinfo=UTC)
+    return utc_dt.strftime("%Y-%m-%d %H:%M:%S")
 
 
 def combine_date_and_time(date_str: str, time_text: str) -> str:
@@ -194,73 +282,63 @@ def combine_date_and_time(date_str: str, time_text: str) -> str:
 
     eastern = ZoneInfo("America/New_York")
 
-    # Clean up date_str: remove day-of-week prefix like "Mon, "
-    cleaned_date = re.sub(r"^[A-Za-z]+,\s*", "", date_str.strip())
-    # Handle "Today" / "Tomorrow" by skipping date parse
-    if cleaned_date.lower() in ("today", "tomorrow"):
-        now_eastern = datetime.now(eastern)
-        if cleaned_date.lower() == "tomorrow":
-            now_eastern += timedelta(days=1)
-        cleaned_date = now_eastern.strftime("%B %d, %Y")
-
-    # Parse time: "4:00 AM" or "16:00"
-    parsed_time = None
-    for fmt in ("%I:%M %p", "%H:%M"):
-        try:
-            parsed_time = datetime.strptime(time_text, fmt).time()
-            break
-        except ValueError:
-            continue
-    if parsed_time is None:
+    local_naive = parse_match_datetime_local(date_str, time_text)
+    if local_naive is None:
         return ""
 
-    # Parse date: "February 9, 2026"
-    parsed_date = None
-    for fmt in ("%B %d, %Y", "%b %d, %Y"):
-        try:
-            parsed_date = datetime.strptime(cleaned_date, fmt).date()
-            break
-        except ValueError:
-            continue
-    if parsed_date is None:
-        return ""
-
-    local_dt = datetime.combine(parsed_date, parsed_time, tzinfo=eastern)
-    utc_dt = local_dt.astimezone(UTC)
-    return utc_dt.strftime("%Y-%m-%d %H:%M:%S")
+    local_dt = local_naive.replace(tzinfo=eastern)
+    return _format_utc(local_dt)
 
 
-def parse_match_timestamp(item, date_str: str) -> str:
+def parse_match_timestamp(
+    item,
+    date_str: str,
+    *,
+    page_utc_offset: timedelta | None = None,
+    prefer_date_time: bool = False,
+    allow_eta: bool = True,
+) -> str:
     """Multi-strategy timestamp extraction for a match item.
 
     1. .moment-tz-convert[data-utc-ts]
-    2. .ml-eta countdown -> utcnow() + delta
-    3. date header + .match-item-time -> Eastern -> UTC
-    4. '' if all fail
+    2. date header + .match-item-time + inferred page offset -> UTC
+    3. .ml-eta countdown -> utcnow() + delta
+    4. date header + .match-item-time -> Eastern -> UTC
+    5. '' if all fail
     """
     # Strategy 1: direct UTC timestamp element
     ts_elem = item.css_first(".moment-tz-convert")
     if ts_elem:
-        unix_ts = ts_elem.attributes.get("data-utc-ts")
-        if unix_ts:
-            try:
-                return datetime.fromtimestamp(
-                    int(unix_ts), tz=UTC
-                ).strftime("%Y-%m-%d %H:%M:%S")
-            except (ValueError, OSError):
-                pass
+        timestamp = parse_vlr_data_timestamp(ts_elem.attributes.get("data-utc-ts", ""))
+        if timestamp:
+            return timestamp
 
-    # Strategy 2: ETA countdown
-    eta_elem = item.css_first(".ml-eta")
-    if eta_elem:
-        delta = parse_eta_to_timedelta(eta_elem.text())
-        if delta is not None:
-            utc_dt = datetime.now(UTC) + delta
-            return utc_dt.strftime("%Y-%m-%d %H:%M:%S")
-
-    # Strategy 3: date header + match time
     time_elem = item.css_first(".match-item-time")
+
+    # Strategy 2: exact page date/time once the page timezone offset is known.
+    if time_elem and page_utc_offset is not None:
+        result = combine_date_and_time_with_offset(
+            date_str,
+            time_elem.text().strip(),
+            page_utc_offset,
+        )
+        if result:
+            return result
+
+    # Strategy 3: ETA countdown.
+    if allow_eta:
+        eta_elem = item.css_first(".ml-eta")
+        if eta_elem:
+            delta = parse_eta_to_timedelta(eta_elem.text())
+            if delta is not None:
+                utc_dt = datetime.now(UTC) + delta
+                return utc_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    # Strategy 4: legacy date header + match time fallback.
     if time_elem:
+        if prefer_date_time:
+            return ""
+
         time_text = time_elem.text().strip()
         result = combine_date_and_time(date_str, time_text)
         if result:

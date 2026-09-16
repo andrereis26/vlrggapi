@@ -53,6 +53,9 @@ class TestParseEta:
     def test_days_hours(self):
         assert parse_eta_to_timedelta("1d 2h") == timedelta(days=1, hours=2)
 
+    def test_weeks_days(self):
+        assert parse_eta_to_timedelta("1w 1d") == timedelta(days=8)
+
     def test_minutes_only(self):
         assert parse_eta_to_timedelta("30m") == timedelta(minutes=30)
 

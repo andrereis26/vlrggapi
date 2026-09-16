@@ -1,6 +1,8 @@
 import asyncio
 import logging
 import re
+from collections import Counter
+from datetime import datetime, timedelta
 
 from utils.cache_manager import cache_manager
 from utils.constants import (
@@ -9,6 +11,8 @@ from utils.constants import (
     CACHE_TTL_UPCOMING,
     LIVE_DETAIL_FETCH_CONCURRENCY,
     LIVE_DETAIL_FETCH_TIMEOUT,
+    MATCH_DETAIL_TAB_FETCH_CONCURRENCY,
+    MATCH_DETAIL_TAB_FETCH_TIMEOUT,
     VLR_BASE_URL,
     VLR_MATCHES_URL,
 )
@@ -19,9 +23,11 @@ from utils.html_parsers import (
     extract_match_teams,
     extract_text_content,
     normalize_image_url,
+    parse_match_datetime_local,
     parse_href_id_slug,
     parse_html,
     parse_match_timestamp,
+    parse_vlr_data_timestamp,
 )
 from utils.http_client import fetch_with_retries, get_http_client
 from utils.pagination import PaginationConfig, scrape_multiple_pages
@@ -36,6 +42,165 @@ def _safe_flag(team_node) -> str:
         return ""
     flag_class = flag_elem.attributes.get("class", "")
     return flag_class.replace(" mod-", "").replace("16", "_")
+
+
+def _match_key_from_href(href: str) -> str:
+    match_id, _ = parse_href_id_slug(href)
+    return match_id or href.strip("/")
+
+
+def _parse_api_timestamp(value: str) -> datetime | None:
+    try:
+        return datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError):
+        return None
+
+
+def _iter_upcoming_page_items(html: HTMLParser):
+    date_labels = html.css(".wf-label.mod-large")
+
+    if not date_labels:
+        for item in html.css("a.wf-module-item"):
+            yield "", item
+        return
+
+    for label in date_labels:
+        date_str = label.text().strip()
+        sibling = label.next
+        card = None
+        while sibling is not None:
+            if hasattr(sibling, 'tag') and sibling.tag and sibling.attributes:
+                classes = sibling.attributes.get("class", "")
+                if "wf-card" in classes:
+                    card = sibling
+                    break
+            sibling = sibling.next
+        if card is None:
+            continue
+        for item in card.css("a.wf-module-item"):
+            yield date_str, item
+
+
+def _infer_page_utc_offset(
+    html: HTMLParser,
+    reference_timestamps: dict[str, str] | None,
+) -> timedelta | None:
+    if not reference_timestamps:
+        return None
+
+    offsets: Counter[int] = Counter()
+    for date_str, item in _iter_upcoming_page_items(html):
+        href = item.attributes.get("href", "")
+        reference = reference_timestamps.get(_match_key_from_href(href))
+        if not reference:
+            continue
+
+        reference_dt = _parse_api_timestamp(reference)
+        time_elem = item.css_first(".match-item-time")
+        if reference_dt is None or time_elem is None:
+            continue
+
+        local_dt = parse_match_datetime_local(date_str, time_elem.text().strip())
+        if local_dt is None:
+            continue
+
+        offset_seconds = round((local_dt - reference_dt).total_seconds() / 60) * 60
+        if -12 * 3600 <= offset_seconds <= 14 * 3600:
+            offsets[int(offset_seconds)] += 1
+
+    if not offsets:
+        return None
+
+    return timedelta(seconds=offsets.most_common(1)[0][0])
+
+
+def _homepage_upcoming_timestamps(html: HTMLParser) -> dict[str, str]:
+    timestamps: dict[str, str] = {}
+
+    for item in html.css(".js-home-matches-upcoming a.wf-module-item"):
+        href = item.attributes.get("href", "")
+        match_key = _match_key_from_href(href)
+        if not match_key:
+            continue
+
+        timestamp = parse_match_timestamp(item, "", allow_eta=False)
+        if timestamp:
+            timestamps[match_key] = timestamp
+
+    return timestamps
+
+
+async def _fetch_homepage_upcoming_timestamps(
+    *,
+    max_retries: int,
+    request_delay: float,
+    timeout: int,
+) -> dict[str, str]:
+    try:
+        client = get_http_client()
+        resp = await fetch_with_retries(
+            VLR_BASE_URL,
+            client=client,
+            timeout=timeout,
+            max_retries=max_retries,
+            request_delay=request_delay,
+        )
+        if resp.status_code != 200:
+            logger.warning("Homepage timestamp reference returned status %d", resp.status_code)
+            return {}
+
+        return _homepage_upcoming_timestamps(parse_html(resp.text))
+    except Exception as e:
+        logger.warning("Failed to fetch homepage timestamp reference: %s", e)
+        return {}
+
+
+def _extract_detail_timestamp(html: HTMLParser) -> str:
+    ts_elem = html.css_first(".match-header-date .moment-tz-convert")
+    if ts_elem is None:
+        return ""
+
+    return parse_vlr_data_timestamp(ts_elem.attributes.get("data-utc-ts", ""))
+
+
+async def _fill_missing_upcoming_timestamps(
+    data: dict,
+    *,
+    max_retries: int,
+    request_delay: float,
+) -> None:
+    segments = data.get("data", {}).get("segments", [])
+    missing_segments = [
+        segment
+        for segment in segments
+        if not segment.get("unix_timestamp") and segment.get("match_page")
+    ]
+    if not missing_segments:
+        return
+
+    client = get_http_client()
+    semaphore = asyncio.Semaphore(MATCH_DETAIL_TAB_FETCH_CONCURRENCY)
+
+    async def fetch_timestamp(segment):
+        try:
+            async with semaphore:
+                resp = await fetch_with_retries(
+                    segment["match_page"],
+                    client=client,
+                    timeout=MATCH_DETAIL_TAB_FETCH_TIMEOUT,
+                    max_retries=max_retries,
+                    request_delay=request_delay,
+                )
+            if resp.status_code != 200:
+                return
+
+            timestamp = _extract_detail_timestamp(parse_html(resp.text))
+            if timestamp:
+                segment["unix_timestamp"] = timestamp
+        except Exception as e:
+            logger.warning("Failed to fetch detail timestamp %s: %s", segment["match_page"], e)
+
+    await asyncio.gather(*(fetch_timestamp(segment) for segment in missing_segments))
 
 
 
@@ -229,7 +394,7 @@ async def vlr_live_score(num_pages=1, from_page=None, to_page=None):
     return await cache_manager.get_or_create_async(CACHE_TTL_LIVE, build, "live_score")
 
 
-def _parse_single_match(item, date_str, page):
+def _parse_single_match(item, date_str, page, page_utc_offset: timedelta | None = None):
     """Extract all match fields from one <a> element. Returns dict or None."""
     eta_element = item.css_first(".ml-eta")
     if eta_element and "ago" in eta_element.text():
@@ -291,7 +456,13 @@ def _parse_single_match(item, date_str, page):
         if icon_src:
             tourney_icon_url = normalize_image_url(icon_src)
 
-    timestamp = parse_match_timestamp(item, date_str)
+    timestamp = parse_match_timestamp(
+        item,
+        date_str,
+        page_utc_offset=page_utc_offset,
+        prefer_date_time=bool(date_str),
+        allow_eta=not bool(date_str),
+    )
 
     return {
         "team1": teams[0],
@@ -310,40 +481,26 @@ def _parse_single_match(item, date_str, page):
     }
 
 
-def _parse_upcoming_page(html: HTMLParser, page: int) -> list[dict]:
+def _parse_upcoming_page(
+    html: HTMLParser,
+    page: int,
+    reference_timestamps: dict[str, str] | None = None,
+    page_utc_offset: timedelta | None = None,
+) -> list[dict]:
     """Parse callback for scrape_multiple_pages — upcoming extended matches."""
     page_results = []
-    date_labels = html.css(".wf-label.mod-large")
+    page_utc_offset = (
+        _infer_page_utc_offset(html, reference_timestamps)
+        or page_utc_offset
+    )
 
-    if date_labels:
-        for label in date_labels:
-            date_str = label.text().strip()
-            sibling = label.next
-            card = None
-            while sibling is not None:
-                if hasattr(sibling, 'tag') and sibling.tag and sibling.attributes:
-                    classes = sibling.attributes.get("class", "")
-                    if "wf-card" in classes:
-                        card = sibling
-                        break
-                sibling = sibling.next
-            if card is None:
-                continue
-            for item in card.css("a.wf-module-item"):
-                try:
-                    match_data = _parse_single_match(item, date_str, page)
-                    if match_data is not None:
-                        page_results.append(match_data)
-                except Exception as e:
-                    logger.warning("Failed to parse match on page %d: %s", page, e)
-    else:
-        for item in html.css("a.wf-module-item"):
-            try:
-                match_data = _parse_single_match(item, "", page)
-                if match_data is not None:
-                    page_results.append(match_data)
-            except Exception as e:
-                logger.warning("Failed to parse match on page %d: %s", page, e)
+    for date_str, item in _iter_upcoming_page_items(html):
+        try:
+            match_data = _parse_single_match(item, date_str, page, page_utc_offset)
+            if match_data is not None:
+                page_results.append(match_data)
+        except Exception as e:
+            logger.warning("Failed to parse match on page %d: %s", page, e)
 
     return page_results
 
@@ -435,11 +592,38 @@ async def vlr_upcoming_matches_extended(
     cache_key = ("upcoming_ext", num_pages, from_page, to_page)
 
     async def build():
-        return await scrape_multiple_pages(
+        reference_timestamps = await _fetch_homepage_upcoming_timestamps(
+            max_retries=max_retries,
+            request_delay=request_delay,
+            timeout=timeout,
+        )
+        last_page_utc_offset: timedelta | None = None
+
+        def parse_upcoming_page(html: HTMLParser, page: int) -> list[dict]:
+            nonlocal last_page_utc_offset
+            page_utc_offset = _infer_page_utc_offset(html, reference_timestamps)
+            if page_utc_offset is not None:
+                last_page_utc_offset = page_utc_offset
+            else:
+                page_utc_offset = last_page_utc_offset
+
+            return _parse_upcoming_page(
+                html,
+                page,
+                page_utc_offset=page_utc_offset,
+            )
+
+        data = await scrape_multiple_pages(
             base_url=VLR_MATCHES_URL,
-            parse_func=_parse_upcoming_page,
+            parse_func=parse_upcoming_page,
             config=config,
         )
+        await _fill_missing_upcoming_timestamps(
+            data,
+            max_retries=max_retries,
+            request_delay=request_delay,
+        )
+        return data
 
     return await cache_manager.get_or_create_async(CACHE_TTL_UPCOMING, build, *cache_key)
 
